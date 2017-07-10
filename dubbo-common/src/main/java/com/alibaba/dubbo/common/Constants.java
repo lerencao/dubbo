@@ -579,6 +579,11 @@ public class Constants {
 
     public static final String GENERIC_SERIALIZATION_BEAN          = "bean";
 
+    public static final String COMPRESSION_KEY = "compression";
+    public static final String DEFAULT_COMPRESSION_VALUE = "none";
+    public static final String COMPRESSION_THRESHOLD_KEY = "compression_threshold";
+    public static final int DEFAULT_COMPRESSION_THRESHOLD = 4 * 1024 * 1024;
+
     /*
      * private Constants(){ }
      */

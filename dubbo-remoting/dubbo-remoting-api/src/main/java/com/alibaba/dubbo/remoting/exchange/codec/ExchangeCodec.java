@@ -15,9 +15,7 @@
  */
 package com.alibaba.dubbo.remoting.exchange.codec;
 
-import java.io.IOException;
-import java.io.InputStream;
-
+import com.alibaba.dubbo.common.Constants;
 import com.alibaba.dubbo.common.io.Bytes;
 import com.alibaba.dubbo.common.io.StreamUtils;
 import com.alibaba.dubbo.common.logger.Logger;
@@ -31,11 +29,17 @@ import com.alibaba.dubbo.remoting.RemotingException;
 import com.alibaba.dubbo.remoting.buffer.ChannelBuffer;
 import com.alibaba.dubbo.remoting.buffer.ChannelBufferInputStream;
 import com.alibaba.dubbo.remoting.buffer.ChannelBufferOutputStream;
+import com.alibaba.dubbo.remoting.buffer.ChannelBuffers;
 import com.alibaba.dubbo.remoting.exchange.Request;
 import com.alibaba.dubbo.remoting.exchange.Response;
 import com.alibaba.dubbo.remoting.exchange.support.DefaultFuture;
 import com.alibaba.dubbo.remoting.telnet.codec.TelnetCodec;
 import com.alibaba.dubbo.remoting.transport.CodecSupport;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
 
 /**
  * ExchangeCodec.
@@ -64,7 +68,10 @@ public class ExchangeCodec extends TelnetCodec {
 
     protected static final byte     FLAG_EVENT     = (byte) 0x20;
 
-    protected static final int      SERIALIZATION_MASK = 0x1f;
+    protected static final byte FLAG_COMPRESSION = (byte) 0x10;
+
+    protected static final int SERIALIZATION_MASK = 0x0f;
+
 
     public Short getMagicCode() {
         return MAGIC;
@@ -141,6 +148,12 @@ public class ExchangeCodec extends TelnetCodec {
     protected Object decodeBody(Channel channel, InputStream is, byte[] header) throws IOException {
         byte flag = header[2], proto = (byte) (flag & SERIALIZATION_MASK);
         Serialization s = CodecSupport.getSerialization(channel.getUrl(), proto);
+
+        // decompress data from input stream
+        if ((flag & FLAG_COMPRESSION) != 0) {
+            is = new GZIPInputStream(is);
+        }
+
         ObjectInput in = s.deserialize(channel.getUrl(), is);
         // get request id.
         long id = Bytes.bytes2long(header, 4);
@@ -165,6 +178,10 @@ public class ExchangeCodec extends TelnetCodec {
                     }
                     res.setResult(data);
                 } catch (Throwable t) {
+                    if (logger.isWarnEnabled()) {
+                        logger.warn("Decode response failed: " + t.getMessage(), t);
+                    }
+
                     res.setStatus(Response.CLIENT_ERROR);
                     res.setErrorMessage(StringUtils.toString(t));
                 }
@@ -191,6 +208,10 @@ public class ExchangeCodec extends TelnetCodec {
                 }
                 req.setData(data);
             } catch (Throwable t) {
+                if (logger.isWarnEnabled()) {
+                    logger.warn("Decode request failed: " + t.getMessage(), t);
+                }
+
                 // bad request
                 req.setBroken(true);
                 req.setData(t);
@@ -239,6 +260,21 @@ public class ExchangeCodec extends TelnetCodec {
         bos.flush();
         bos.close();
         int len = bos.writtenBytes();
+
+        String compressType =
+                channel.getUrl().getParameter(Constants.COMPRESSION_KEY, Constants.DEFAULT_COMPRESSION_VALUE);
+        int compressThreshold = channel.getUrl().getParameter(
+                Constants.COMPRESSION_THRESHOLD_KEY,
+                Constants.DEFAULT_COMPRESSION_THRESHOLD
+        );
+        // NOTICE(changyang): can only know whether need to do compression after the length is determined
+        if (compressType.equals("gzip") && len > compressThreshold) {
+            // set the compression flags
+            header[2] |= FLAG_COMPRESSION;
+            // rewrite the data length to compressed data length
+            len = rewriteCompressedBody(buffer, savedWriteIndex + HEADER_LENGTH, len);
+        }
+
         checkPayload(channel, len);
         Bytes.int2bytes(len, header, 12);
 
@@ -282,6 +318,21 @@ public class ExchangeCodec extends TelnetCodec {
             bos.close();
 
             int len = bos.writtenBytes();
+
+            String compressType =
+                    channel.getUrl().getParameter(Constants.COMPRESSION_KEY, Constants.DEFAULT_COMPRESSION_VALUE);
+            int compressThreshold = channel.getUrl().getParameter(
+                    Constants.COMPRESSION_THRESHOLD_KEY,
+                    Constants.DEFAULT_COMPRESSION_THRESHOLD
+            );
+            // NOTICE(changyang): can only know whether need to do compression after the length is determined
+            if (compressType.equals("gzip") && len > compressThreshold) {
+                // set the compression flags
+                header[2] |= FLAG_COMPRESSION;
+                // rewrite the data length to compressed data length
+                len = rewriteCompressedBody(buffer, savedWriteIndex + HEADER_LENGTH, len);
+            }
+
             checkPayload(channel, len);
             Bytes.int2bytes(len, header, 12);
             // write
@@ -426,4 +477,25 @@ public class ExchangeCodec extends TelnetCodec {
         encodeResponseData(out, data);
     }
 
+
+    private int rewriteCompressedBody(ChannelBuffer buffer, int bodyStartIndex, int bodyLength) throws IOException {
+        // create a temp buffer to stash the compressed data.
+        ChannelBuffer compressedDataChannelBuffer = ChannelBuffers.dynamicBuffer();
+        ChannelBufferOutputStream compressedDataChannelBufferOutputStream =
+                new ChannelBufferOutputStream(compressedDataChannelBuffer);
+        GZIPOutputStream compressedOS = new GZIPOutputStream(compressedDataChannelBufferOutputStream);
+
+        // compress the data to output stream from savedWriteIndex+HEADER_LENGTH
+        buffer.getBytes(bodyStartIndex, compressedOS, bodyLength);
+        compressedOS.flush();
+        compressedOS.close();
+
+        // finally, write the compressed data back into buffer.
+        final int compressedLength = compressedDataChannelBufferOutputStream.writtenBytes();
+        buffer.writerIndex(bodyStartIndex);
+        buffer.writeBytes(compressedDataChannelBuffer, compressedLength);
+
+        // return the compressed data length
+        return compressedLength;
+    }
 }
